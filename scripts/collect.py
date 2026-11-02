@@ -19,10 +19,10 @@ DATA = Path(os.environ.get("DATA_DIR", "data"))
 AF_ADDRESS = "0xfefefefefefefefefefefefefefefefefefefefe"
 HLP_ADDRESS = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303"
 ATTEMPTS = 3
-STATS_URL = os.environ.get("HL_STATS_URL", "https://stats-data.hyperliquid.xyz/Mainnet/cumulative_new_users")
 DAY_MS = 86_400_000
 FILL_PAGE_SIZE = 2000
-FILL_PAGES = 5  # the API exposes at most the 10,000 most recent fills
+FILL_PAGES = int(os.environ.get("FILL_PAGES", 15))
+FILL_PAUSE_SECONDS = float(os.environ.get("FILL_PAUSE_SECONDS", 6))  # stays under the API rate limit
 
 
 def post(body):
@@ -96,63 +96,59 @@ def hip3():
     return {"hip3_oi_busd": round(sum(by_dex.values()) / 1e3, 3), "hip3_oi_by_dex_musd": by_dex}
 
 
-def get_json(url):
-    request = urllib.request.Request(url, headers={"User-Agent": "hype-monitor/1.0"})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.load(response)
-
-
 def buyback():
-    """Assistance Fund HYPE/USDC spot buys from its own fills. Reports the window actually covered."""
+    """Assistance Fund HYPE/USDC spot buys from its own fills.
+
+    Pages forward from 30 days ago until the API runs out. A run that hits the page cap is
+    rejected, because its most recent days would be missing and the totals would be too low.
+    The API may not reach back the full 30 days, so each total needs real coverage.
+    """
     meta = post({"type": "spotMeta"})
     hype = next(token["index"] for token in meta["tokens"] if token["name"] == "HYPE")
     pair = next(u["name"] for u in meta["universe"] if u["tokens"] == [hype, 0])
     now_ms = int(time.time() * 1000)
-    start = now_ms - 30 * DAY_MS
-    fills, cursor = [], start
-    for _ in range(FILL_PAGES):
+    fills, cursor, complete = {}, now_ms - 30 * DAY_MS, False
+    for page_number in range(FILL_PAGES):
+        if page_number:
+            time.sleep(FILL_PAUSE_SECONDS)
         page = post({"type": "userFillsByTime", "user": AF_ADDRESS, "startTime": cursor, "aggregateByTime": True})
-        fills += page
+        for fill in page:
+            fills[(fill.get("tid"), fill["time"], fill["px"], fill["sz"])] = fill
         if len(page) < FILL_PAGE_SIZE:
+            complete = True
             break
-        cursor = max(fill["time"] for fill in page) + 1
-    buys = [f for f in fills if f["coin"] == pair and f["side"] == "B"]
+        newest = max(fill["time"] for fill in page)
+        cursor = newest if newest > cursor else cursor + 1
+    if not complete:
+        raise RuntimeError(f"page cap reached after {len(fills)} fills; totals would be incomplete")
+    buys = [f for f in fills.values() if f["coin"] == pair and f["side"] == "B"]
     if not buys:
         raise RuntimeError(f"no {pair} buys among {len(fills)} fills")
 
-    def total(days):
-        rows = [f for f in buys if f["time"] >= now_ms - days * DAY_MS]
+    covered = (now_ms - min(f["time"] for f in buys)) / DAY_MS
+
+    def total(rows):
         usd = sum(float(f["px"]) * float(f["sz"]) for f in rows)
         return round(usd / 1e6, 3), round(sum(float(f["sz"]) for f in rows), 1)
 
-    covered = (now_ms - min(f["time"] for f in buys)) / DAY_MS
-    result = {"buyback_window_days": round(covered, 2), "buyback_fills": len(buys)}
+    window_usd, window_hype = total(buys)
+    result = {
+        "buyback_window_days": round(covered, 2),
+        "buyback_latest_age_h": round((now_ms - max(f["time"] for f in buys)) / 3_600_000, 2),
+        "buyback_fills": len(buys),
+        "buyback_window_musd": window_usd,
+        "buyback_window_hype": window_hype,
+        "buyback_avg_day_musd": round(window_usd / covered, 3) if covered else None,
+    }
     for days in (1, 7, 30):
-        usd, hype_bought = total(days) if covered >= days * 0.98 else (None, None)
-        result[f"buyback_{days}d_musd"], result[f"buyback_{days}d_hype"] = usd, hype_bought
+        rows = [f for f in buys if f["time"] >= now_ms - days * DAY_MS]
+        usd, bought = total(rows) if covered >= days * 0.98 else (None, None)
+        result[f"buyback_{days}d_musd"], result[f"buyback_{days}d_hype"] = usd, bought
     return result
 
 
-def new_users():
-    """Hyperliquid's own stats feed. Unverified source: freshness is reported, not assumed."""
-    data = get_json(STATS_URL)
-    rows = next((data[key] for key in ("table_data", "chart_data", "data") if key in data), None)
-    if not rows or "daily_new_users" not in rows[-1]:
-        raise RuntimeError(f"unexpected shape: {list(data)[:5]}")
-    rows = sorted(rows, key=lambda row: row["time"])
-    recent = [row["daily_new_users"] for row in rows]
-    return {
-        "new_users_last_date": str(rows[-1]["time"])[:10],
-        "new_users_1d": recent[-1],
-        "new_users_7d": sum(recent[-7:]),
-        "new_users_30d": sum(recent[-30:]),
-        "users_total": rows[-1].get("cumulative_new_users"),
-    }
-
-
 BLOCKS = {
-    "buyback": (buyback, ["buyback_window_days", "buyback_fills", "buyback_1d_musd", "buyback_1d_hype", "buyback_7d_musd", "buyback_7d_hype", "buyback_30d_musd", "buyback_30d_hype"]),
-    "new_users": (new_users, ["new_users_last_date", "new_users_1d", "new_users_7d", "new_users_30d", "users_total"]),
+    "buyback": (buyback, ["buyback_window_days", "buyback_latest_age_h", "buyback_fills", "buyback_window_musd", "buyback_window_hype", "buyback_avg_day_musd", "buyback_1d_musd", "buyback_1d_hype", "buyback_7d_musd", "buyback_7d_hype", "buyback_30d_musd", "buyback_30d_hype"]),
     "hype_market": (hype_market, ["mark_px", "funding_hl_8h_pct", "hype_oi_hl_busd", "hype_vol24_musd"]),
     "assistance_fund": (assistance_fund, ["af_hype", "af_hype_m"]),
     "hlp": (hlp, ["hlp_tvl_musd", "hlp_pnl_30d_musd", "hlp_pnl_30d_pct"]),
